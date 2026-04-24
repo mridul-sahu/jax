@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 import dataclasses
 from functools import update_wrapper, reduce, partial, wraps
 from typing import Any, Generic, TypeVar
+import itertools as it
 
 from jax._src import config
 from jax._src import core
@@ -1826,8 +1827,29 @@ def _remat_opt_dce(used_outs: list[bool], eqn: core.JaxprEqn):
     used_ins = [False] * eqn.params["num_consts"] + used_ins
     return used_ins, new_eqn
 
+def _remat_opt_to_lojax(*hi_args, fwd_jaxpr, num_consts, **params):
+  from jax._src.lax.eval_jaxpr import eval_jaxpr_p  # pyrefly: ignore[missing-import]
+  if any(aval.has_qdd for aval in fwd_jaxpr.in_aval_qdds):
+    raise NotImplementedError("remat_opt does not support qdd on inputs")
+  if any(aval.has_qdd for aval in fwd_jaxpr.final_aval_qdds):
+    raise NotImplementedError("remat_opt does not support qdd on outputs")
+
+  lo_fwd_jaxpr = pe.lower_jaxpr2(fwd_jaxpr)
+  lo_args = [
+      lo_val for aval, x in zip(fwd_jaxpr.in_aval_qdds, hi_args)
+      for lo_val in aval.lower_val(x)]  # pyrefly: ignore[missing-attribute]
+  lo_outs = eval_jaxpr_p.bind(*lo_args, jaxpr=lo_fwd_jaxpr)
+  lo_outs_ = iter(lo_outs)
+  hi_outs = [
+      t.raise_val(*it.islice(lo_outs_, len(t.lo_ty())))
+      for t in fwd_jaxpr.out_avals]
+  assert next(lo_outs_, None) is None
+  return hi_outs
+
 remat_opt_p = core.Primitive("remat_opt")
 remat_opt_p.multiple_results = True
+remat_opt_p.is_high = lambda *_, fwd_jaxpr, **__: fwd_jaxpr.jaxpr.is_high
+remat_opt_p.to_lojax = _remat_opt_to_lojax
 remat_opt_p.def_impl(_remat_opt_impl)
 remat_opt_p.def_effectful_abstract_eval(_remat_opt_abstract_eval)
 mlir.register_lowering(remat_opt_p, mlir.lower_fun(

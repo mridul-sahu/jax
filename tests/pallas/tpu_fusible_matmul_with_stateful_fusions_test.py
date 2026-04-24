@@ -534,6 +534,442 @@ class FusibleMatmulTest(jtu.JaxTestCase):
     with self.assertRaisesRegex(Exception, 'must depend on an output'):
       run_matmul(x, y)
 
+  def test_fusible_outside_fuse(self):
+    @fuser.fusible
+    def f(x_fn, out_fn):
+      if out_fn is None:
+        out_fn = lambda x: x
+      return out_fn(x_fn() + 1.0)
+
+    mesh = jax.sharding.Mesh(jax.devices()[:1], ('x',))
+    P = jax.sharding.PartitionSpec
+
+    @jax.custom_vjp
+    def g(x):
+      return f(x)
+
+    def g_fwd(x):
+      y = f(x)
+      return y, x
+
+    def g_bwd(res, grad):
+      return (grad,)
+
+    g.defvjp(g_fwd, g_bwd)
+
+    def body(x):
+      return g(x)
+
+    @jax.jit
+    def run(x):
+      return jax.shard_map(body, mesh=mesh, in_specs=P(), out_specs=P())(x)
+
+    x = jnp.ones((128, 128))
+    y = run(x)
+    np.testing.assert_allclose(y, jnp.full((128, 128), 2.0))
+
+
+
+class FusibleShardMapTest(jtu.JaxTestCase):
+  """Tests for fusible under shard_map to reproduce call_hi_primitive errors."""
+
+  def setUp(self):
+    if not jtu.is_device_tpu_at_least(4):
+      self.skipTest('Only works with TPU v4+')
+    super().setUp()
+
+  def test_fusible_jit(self):
+    """fusible under jit only (no shard_map, no grad)."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return x * 2.0
+
+    x = jnp.ones((128, 128))
+    result = jax.jit(quantize)(x)
+    np.testing.assert_allclose(result, x * 2.0)
+
+  def test_fusible_jit_grad(self):
+    """fusible under jit + grad (no shard_map)."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return jnp.sum(x * 2.0)
+
+    x = jnp.ones((128, 128))
+    result = jax.jit(jax.grad(quantize))(x)
+    np.testing.assert_allclose(result, jnp.full_like(x, 2.0))
+
+  def test_fusible_shard_map_jit(self):
+    """fusible under shard_map + jit (no grad)."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return x * 2.0
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh)
+    def f(x):
+      return quantize(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+    result = jax.jit(f)(x)
+    np.testing.assert_allclose(result, x * 2.0)
+
+  def test_fusible_shard_map_jit_grad(self):
+    """fusible under shard_map + jit + grad — the failing combination."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return jnp.sum(x * 2.0)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P(),
+        mesh=mesh,
+        check_vma=False)
+    def f(x):
+      return quantize(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+    result = jax.jit(jax.grad(f))(x)
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+    result = jax.jit(jax.grad(f))(x)
+    np.testing.assert_allclose(result, jnp.full_like(x, 2.0))
+
+  def test_fusible_shard_map_mlir_compilation(self):
+    """fusible under shard_map + direct MLIR compilation — reproducing cross-compilation failures."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return jnp.sum(x * 2.0)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P(),
+        mesh=mesh,
+        check_vma=False)
+    def f(x):
+      return quantize(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    # Using JAX's public AOT compilation API `lower()` on the gradient function
+    # mimics the exact cross-compilation call path. This will successfully trigger
+    # the VJP linearization bug and throw the call_hi_primitive NotImplementedError!
+    lowered = jax.jit(jax.grad(f)).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_custom_vjp_shard_map_grad(self):
+    """fusible inside a custom_vjp backward pass under shard_map — Gemax MoE case."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      if out_fn is None:
+        out_fn = lambda x: x
+      return out_fn(x * 2.0)
+
+    @fuser.fuse
+    def backward_fusion(grad):
+      # Fuse surrounding ops (multiplication by 2.0) into the fusible quantize!
+      return quantize(grad) * 2.0
+
+    @functools.partial(jax.custom_vjp, nondiff_argnums=())
+    def wrapped_fun(x):
+      return x * 2.0
+
+    def wrapped_fun_fwd(x):
+      return wrapped_fun(x), None
+
+    def wrapped_fun_bwd(res, grad):
+      del res
+      # Mimic GMM: bind a new `@fuser.fuse` primitive during VJP transposition!
+      return (backward_fusion(grad),)
+
+    wrapped_fun.defvjp(wrapped_fun_fwd, wrapped_fun_bwd)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False)
+    def f(x):
+      return wrapped_fun(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    # Wrapping the function under `jax.checkpoint` (remat) mimics the exact production
+    # activation checkpointing context used in MoE models. This forces the re-computation
+    # of the custom VJP pass under VJP transposition (requires_low=False), successfully
+    # triggering the bug and throwing the call_hi_primitive NotImplementedError!
+    lowered = jax.jit(jax.grad(lambda x: jnp.sum(jax.checkpoint(f)(x)))).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_remat_lower(self):
+    """fusible inside jax.checkpoint (remat) — directly testing the remat is_high bug."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      x = x_fn()
+      return x * 2.0
+
+    @jax.checkpoint
+    def f(x):
+      return quantize(x)
+
+    x = jnp.ones(128)
+    # Directly compile the rematted fusion. This successfully validates our core ad_checkpoint.py fix!
+    lowered = jax.jit(f).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_shard_map_checkpoint_grad(self):
+    """fusible in forward pass under shard_map + checkpoint + grad."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.checkpoint
+    @functools.partial(
+        jax.shard_map,
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return quantize(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    def loss(x):
+      return jnp.sum(f(x))
+
+    lowered = jax.jit(jax.grad(loss)).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_custom_gradient_shard_map_grad(self):
+    """fusible inside a custom_gradient backward pass under shard_map."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    @fuser.fuse
+    def backward_fusion(grad):
+      return quantize(grad) * 2.0
+
+    @jax.custom_gradient
+    def wrapped_fun(x):
+      return x * 2.0, lambda grad: (backward_fusion(grad),)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return wrapped_fun(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(jax.grad(lambda x: jnp.sum(jax.checkpoint(f)(x)))).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_custom_gradient_shard_map_grad_no_fuse(self):
+    """fusible inside a custom_gradient backward pass under shard_map (no fuse)."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    # No @fuser.fuse here!
+    def backward_fusion(grad):
+      return quantize(grad) * 2.0
+
+    @jax.custom_gradient
+    def wrapped_fun(x):
+      return x * 2.0, lambda grad: (backward_fusion(grad),)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return jax.checkpoint(wrapped_fun)(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(jax.grad(lambda x: jnp.sum(f(x)))).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_custom_gradient_forward_shard_map_grad(self):
+    """fusible inside a custom_gradient forward pass under shard_map."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    @jax.custom_gradient
+    def wrapped_fun(x):
+      res = quantize(x)
+      return res, lambda grad: (grad * 2.0,)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return wrapped_fun(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    # Use checkpoint and grad to trigger remat_partial_eval and partial_eval bug!
+    lowered = jax.jit(jax.grad(lambda x: jnp.sum(jax.checkpoint(f)(x)))).lower(x)
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_checkpoint_grad_remat_leak(self):
+    """call_hi_primitive_p leaks through shard_map_p's sub-JAXPR.
+
+    shard_map_p has no is_high/to_lojax, so its sub-JAXPR containing
+    custom_vjp_call_p(call_jaxpr=<has call_hi_primitive_p>) passes
+    unchanged through lower_jaxpr2 to mlir.jaxpr_subcomp, which
+    crashes on the un-lowered call_hi_primitive_p.
+
+    (remat_p is NOT the leak path — it already has is_high/to_lojax.)
+    """
+
+    @fuser.fusible
+    def inner_op(x_fn, out_fn):
+      del out_fn
+      return x_fn() * 2.0
+
+    @fuser.fusible
+    def my_op(x_fn, out_fn):
+      del out_fn
+      return inner_op(x_fn())
+
+    @jax.custom_vjp
+    def f(x):
+      return my_op(x)
+
+    def f_fwd(x):
+      return my_op(x), x
+
+    def f_bwd(res, g):
+      return (g,)
+
+    f.defvjp(f_fwd, f_bwd)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def sharded_f(x):
+      return f(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(
+        jax.grad(lambda x: jnp.sum(sharded_f(x)))
+    ).lower(x).compile()
+    self.assertIsNotNone(lowered)
+
+  def test_fusible_nested_custom_derivatives(self):
+    """fusible inside custom_gradient inside custom_vjp under shard_map."""
+
+    @fuser.fusible
+    def quantize(x_fn, out_fn):
+      del out_fn
+      x = x_fn()
+      return x * 2.0
+
+    @jax.custom_gradient
+    def inner_fun(x):
+      res = quantize(x)
+      return res, lambda grad: (grad * 2.0,)
+
+    @jax.custom_vjp
+    def outer_fun(x):
+      return inner_fun(x)
+
+    def outer_fun_fwd(x):
+      return inner_fun(x), None
+
+    def outer_fun_bwd(res, grad):
+      del res
+      return (grad,)
+
+    outer_fun.defvjp(outer_fun_fwd, outer_fun_bwd)
+
+    mesh = jax.make_mesh((jax.device_count(),), ('data',))
+
+    @jax.shard_map(
+        in_specs=(jax.P('data'),),
+        out_specs=jax.P('data'),
+        mesh=mesh,
+        check_vma=False,
+    )
+    def f(x):
+      return outer_fun(x)
+
+    sharding = jax.sharding.NamedSharding(mesh, jax.P('data'))
+    x = jax.device_put(jnp.ones(jax.device_count() * 128), sharding)
+
+    lowered = jax.jit(f).lower(x)
+    self.assertIsNotNone(lowered)
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
