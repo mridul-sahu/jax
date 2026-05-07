@@ -63,6 +63,8 @@ runs:
       continue-on-error: true
       run: |
         mkdir -p $(pwd)/dist
+        # Disable authentication so unauthenticated downloads do not fail.
+        gcloud config set auth/disable_credentials True || true
         if [[ "${INPUTS_DOWNLOAD_JAX_FROM_GCS}" == "1" ]]; then
           gcloud storage cp -r "${INPUTS_GCS_DOWNLOAD_URI}"/jax*py3*none*any.whl $(pwd)/dist/
         else
@@ -87,6 +89,7 @@ runs:
           fi
         fi
       env:
+        CLOUDSDK_AUTH_DISABLE_CREDENTIALS: 1
         OS: ${{ steps.set-vars.outputs.os }}
         ARCH: ${{ steps.set-vars.outputs.arch }}
         PYTHON_MAJOR_MINOR: ${{ steps.set-vars.outputs.python_major_minor }}

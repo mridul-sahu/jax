@@ -59,6 +59,8 @@ runs:
       if: ${{ !contains(inputs.runner, 'windows-x86') }}
       run: |
         mkdir -p $(pwd)/dist
+        # Disable authentication so unauthenticated downloads do not fail.
+        gcloud config set auth/disable_credentials True || true
         gcloud storage cp -r "${INPUTS_GCS_DOWNLOAD_URI}"/jax*py3*none*any.whl $(pwd)/dist/
 
         if [[ "${INPUTS_SKIP_DOWNLOAD_JAXLIB_FROM_GCS}" == "1" ]]; then
@@ -75,6 +77,7 @@ runs:
           fi
         fi
       env:
+        CLOUDSDK_AUTH_DISABLE_CREDENTIALS: 1
         OS: ${{ steps.set-vars.outputs.os }}
         ARCH: ${{ steps.set-vars.outputs.arch }}
         PYTHON_MAJOR_MINOR: ${{ steps.set-vars.outputs.python_major_minor }}
@@ -92,6 +95,8 @@ runs:
       if: ${{ contains(inputs.runner, 'windows-x86') }}
       run: |
         mkdir dist
+        @REM Disable authentication so unauthenticated downloads do not fail.
+        call gcloud config set auth/disable_credentials True
         @REM Use `call` so that we can run sequential gcloud storage commands on Windows
         @REM See https://github.com/GoogleCloudPlatform/gsutil/issues/233#issuecomment-196150652
         call gcloud storage cp -r "%INPUTS_GCS_DOWNLOAD_URI%"/jax*py3*none*any.whl dist/
@@ -102,6 +107,7 @@ runs:
           call gcloud storage cp -r "%INPUTS_GCS_DOWNLOAD_URI%/jaxlib*%PYTHON_MAJOR_MINOR%*%OS%*%ARCH%*.whl" dist/
         )
       env:
+        CLOUDSDK_AUTH_DISABLE_CREDENTIALS: 1
         OS: ${{ steps.set-vars.outputs.os }}
         ARCH: ${{ steps.set-vars.outputs.arch }}
         PYTHON_MAJOR_MINOR: ${{ steps.set-vars.outputs.python_major_minor }}
