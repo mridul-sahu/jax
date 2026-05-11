@@ -3771,6 +3771,7 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
   remainder = 0
   main_range = 0
   ubd = lbd
+  unroll_attr = None
 
   if is_static_steps:
     num_steps_int = cast(int, num_steps)
@@ -3785,7 +3786,7 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
     has_main = main_steps > 0
     has_static_remainder = remainder > 0
     has_dynamic_remainder = False
-  else:
+  elif ctx.forward_compatible:
     num_steps_val = _ensure_mlir_value(
         num_steps, pallas_core.index_map_grid_aval
     )
@@ -3799,10 +3800,23 @@ def _lower_jaxpr_to_for_loop(ctx: LoweringRuleContext,
     has_main = True
     has_static_remainder = False
     has_dynamic_remainder = True
+  else:
+    num_steps_val = _ensure_mlir_value(
+        num_steps, pallas_core.index_map_grid_aval
+    )
+    main_ubd = ubd = arith.addi(lbd, num_steps_val)
+    i32 = ir.IntegerType.get_signless(32)
+    unroll_attr = ir.IntegerAttr.get(i32, unroll)
+
+    has_main = True
+    has_static_remainder = False
+    has_dynamic_remainder = False
 
   if has_main:
     step_val = ir_constant(unroll, mlir_type=_dtype_to_ir_type(jnp.int32))
     main_for_op = scf.ForOp(lbd, main_ubd, step_val, args)
+    if unroll_attr is not None:
+      main_for_op.attributes["tpu.late_unroll"] = unroll_attr
     with ir.InsertionPoint(main_for_op.body):
       iv = main_for_op.induction_variable
       inner_args = main_for_op.inner_iter_args
