@@ -1379,6 +1379,26 @@ class HijaxTest(jtu.JaxTestCase):
     # QArrayTy.lo_ty() returns [int8[m,k], f32[m]], so 'x' is replicated twice
     self.assertEqual(debug_info.arg_names, ('x', 'x'))
 
+  def test_grad_custom_vjp_optimize_remat_with_hijax(self):
+
+    @jax.custom_vjp
+    def f(x):
+      return square(x)
+
+    def f_fwd(x):
+      y = square(x)
+      return y, x  # (primal_out, residuals)
+
+    def f_bwd(res, g):
+      x = res
+      return (g * 2.0 * x,)
+
+    f.defvjp(f_fwd, f_bwd, optimize_remat=True)
+
+    x = jnp.float32(3.0)
+    result = jax.jit(jax.grad(f))(x)
+    self.assertAllClose(result, jnp.float32(6.0))
+
 
 class BoxTest(jtu.JaxTestCase):
 
@@ -2324,6 +2344,56 @@ class LogTest(jtu.JaxTestCase):
 
     jax.grad(partial(f, log))(1.0)
     self.assertAllClose(log._dct, {'g': [jnp.array([6., 6., 3.])]})
+
+  def test_custom_vjp_inlined_when_lower(self):
+    """When requires_low=True, custom_vjp should be inlined."""
+    from jax._src.interpreters import partial_eval as pe
+    from jax._src import linear_util as lu
+    from jax._src.custom_derivatives import custom_vjp_call_p
+
+    @jax.custom_vjp
+    def foo(x):
+      return x * 2.0
+    def foo_fwd(x):
+      return foo(x), x
+    def foo_bwd(res, g):
+      return (g * 2.0,)
+    foo.defvjp(foo_fwd, foo_bwd)
+
+    debug_info = lu.DebugInfo('test', 'test', ('x',), None)
+    f = lu.wrap_init(lambda x: (foo(x),), debug_info=debug_info)
+    in_avals = [core.ShapedArray((), jnp.float32)]
+    jaxpr, _, _ = pe.trace_to_jaxpr_dynamic(f, in_avals, lower=True)
+
+    has_custom_vjp = any(
+        eqn.primitive is custom_vjp_call_p for eqn in jaxpr.eqns)
+    self.assertFalse(has_custom_vjp,
+        "custom_vjp_call_p should be inlined when lower=True")
+
+  def test_custom_jvp_inlined_when_lower(self):
+    """When requires_low=True, custom_jvp should be inlined."""
+    from jax._src.interpreters import partial_eval as pe
+    from jax._src import linear_util as lu
+    from jax._src.custom_derivatives import custom_jvp_call_p
+
+    @jax.custom_jvp
+    def foo(x):
+      return x * 2.0
+    @foo.defjvp
+    def foo_jvp(primals, tangents):
+      x, = primals
+      t, = tangents
+      return x * 2.0, t * 2.0
+
+    debug_info = lu.DebugInfo('test', 'test', ('x',), None)
+    f = lu.wrap_init(lambda x: (foo(x),), debug_info=debug_info)
+    in_avals = [core.ShapedArray((), jnp.float32)]
+    jaxpr, _, _ = pe.trace_to_jaxpr_dynamic(f, in_avals, lower=True)
+
+    has_custom_jvp = any(
+        eqn.primitive is custom_jvp_call_p for eqn in jaxpr.eqns)
+    self.assertFalse(has_custom_jvp,
+        "custom_jvp_call_p should be inlined when lower=True")
 
 
 if __name__ == '__main__':
