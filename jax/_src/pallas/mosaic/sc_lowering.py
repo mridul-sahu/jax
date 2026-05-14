@@ -822,6 +822,27 @@ def _prepare_dma_refs(
           dst_ref, dst_aval, dst_aval.shape, dst_transforms
       )
       indirect_offsets_ref_str = "dst_ref"
+    case (MemorySpace.HOST, MemorySpace.HBM) | (
+        MemorySpace.HBM,
+        MemorySpace.HOST,
+    ):
+      if _has_indirect_offsets(
+          src_transforms, src_transforms_aval, core_type
+      ) or _has_indirect_offsets(
+          dst_transforms, dst_transforms_aval, core_type
+      ):
+        raise NotImplementedError(
+            "Scatter/gather via `pltpu.async_copy` from"
+            f" {src_memory_space!r} to {dst_memory_space!r} is not"
+            " supported"
+        )
+      if is_add:
+        raise ValueError(
+            "DMAs with `add=True` are not supported for"
+            f" {src_memory_space!r} -> {dst_memory_space!r} copies."
+        )
+      indirect_offsets = None
+      indirect_offsets_ref_str = ""
     case _:  # Indirect DMA is not supported.
       if (
           # fmt: off
@@ -910,7 +931,7 @@ def _dma_start_lowering_rule(
           source_semaphore=src_sem,
           device_id=device_id,
           priority=priority,
-        core_id=core_index,
+          core_id=core_index,
       )
       return []
 

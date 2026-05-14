@@ -610,7 +610,7 @@ def memory_space_to_tpu_memory_space(
           raise ValueError(f"Unsupported core type: {core_type}")
     case pallas_core.MemorySpace.ANY:
       return pallas_core.MemorySpace.ANY
-    case pallas_core.MemorySpace.HOST:
+    case pallas_core.MemorySpace.HOST | jax_core.MemorySpace.Host:
       return MemorySpace.HOST
     case (
         pallas_core.MemorySpace.ERROR

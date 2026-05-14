@@ -25,6 +25,7 @@ import hypothesis as hp
 import hypothesis.strategies as hps
 import jax
 from jax import lax
+from jax._src import core as jax_core
 from jax._src import hypothesis_test_util as htu
 from jax._src import test_util as jtu
 from jax._src.pallas import mpmd
@@ -855,6 +856,57 @@ class VectorSubcoreTest(PallasSCTest):
         NotImplementedError, "from HBM to HBM is not supported"
     ):
       kernel(x, indices)
+
+  def test_invalid_gather_host_to_hbm(self):
+    x = jnp.arange(8)
+    indices = jax.random.permutation(jax.random.key(42), x)
+    x = jax.device_put(
+        x,
+        jax.sharding.NamedSharding(
+            jax.sharding.Mesh(jax.devices(), "x"),
+            jax.sharding.PartitionSpec(),
+            memory_kind="pinned_host",
+        ),
+    )
+
+    @self.vector_subcore_kernel(
+        out_shape=jax.ShapeDtypeStruct(shape=x.shape, dtype=jnp.int32),
+        in_specs=(
+            pl.BlockSpec(memory_space=pltpu.HOST),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ),
+    )
+    def kernel(x_host_ref, indices_ref, o_ref):
+      pltpu.sync_copy(x_host_ref.at[indices_ref], o_ref)
+
+    with self.assertRaisesRegex(
+        NotImplementedError, "Scatter/gather via `pltpu.async_copy` from"
+    ):
+      kernel(x, indices)
+
+  def test_invalid_add_host_to_hbm(self):
+    x = jnp.arange(8)
+    x = jax.device_put(
+        x,
+        jax.sharding.NamedSharding(
+            jax.sharding.Mesh(jax.devices(), "x"),
+            jax.sharding.PartitionSpec(),
+            memory_kind="pinned_host",
+        ),
+    )
+
+    @self.vector_subcore_kernel(
+        out_shape=jax.ShapeDtypeStruct(shape=x.shape, dtype=jnp.int32),
+        in_specs=(pl.BlockSpec(memory_space=pltpu.HOST),),
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+    )
+    def kernel(x_host_ref, o_ref):
+      pltpu.sync_copy(x_host_ref, o_ref, add=True)
+
+    with self.assertRaisesRegex(
+        ValueError, "DMAs with `add=True` are not supported for"
+    ):
+      kernel(x)
 
   def test_invalid_gather_1d_offsets_memory_space(self):
     x = jnp.arange(8)
@@ -2507,6 +2559,71 @@ class ScalarSubcoreTest(PallasSCTest):
       pltpu.async_copy(x_ref, o_hbm_ref, sem).wait()
 
     np.testing.assert_array_equal(kernel(x), x)
+
+  def test_host_to_hbm_dma(self):
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+    x = jax.device_put(
+        x,
+        jax.sharding.NamedSharding(
+            jax.sharding.Mesh(jax.devices(), "x"),
+            jax.sharding.PartitionSpec(),
+            memory_kind="pinned_host",
+        ),
+    )
+
+    @jax.jit
+    def foo(x):
+      sc_mesh = plsc.ScalarSubcoreMesh(axis_name="core", num_cores=1)
+
+      y_ref = pl.empty_ref_like(pltpu.HBM(x.shape, x.dtype))
+      x_device = pltpu.with_memory_space_constraint(x, pltpu.HOST)
+      x_ref = jax.new_ref(x_device, memory_space=pltpu.HOST)
+
+      @pl.core_map(
+          mesh=sc_mesh,
+          compiler_params=pltpu.CompilerParams(
+              use_tc_tiling_on_sc=self.USE_TC_TILING,
+          ),
+      )
+      def _():
+        pltpu.sync_copy(x_ref, y_ref)
+
+      return y_ref[...]
+
+    o = jax.block_until_ready(foo(x))
+    np.testing.assert_array_equal(o, x)
+
+  def test_hbm_to_host_dma(self):
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape(8, 128)
+
+    host_sharding = jax.sharding.NamedSharding(
+        jax.sharding.Mesh(jax.devices(), "x"),
+        jax.sharding.PartitionSpec(),
+        memory_kind="pinned_host",
+    )
+
+    @functools.partial(jax.jit, out_shardings=host_sharding)
+    def foo(x):
+      sc_mesh = plsc.ScalarSubcoreMesh(axis_name="core", num_cores=1)
+
+      y_ref = pl.empty_ref_like(pl.HOST(x.shape, x.dtype))
+      x_ref = jax.new_ref(x, memory_space=pltpu.HBM)
+
+      @pl.core_map(
+          mesh=sc_mesh,
+          compiler_params=pltpu.CompilerParams(
+              use_tc_tiling_on_sc=self.USE_TC_TILING,
+          ),
+      )
+      def _():
+        pltpu.sync_copy(x_ref, y_ref)
+
+      return pltpu.with_memory_space_constraint(
+          y_ref[...], jax_core.MemorySpace.Host
+      )
+
+    o = jax.block_until_ready(foo(x))
+    np.testing.assert_array_equal(o, x)
 
 
 class ScalarSubcoreTestWithTCTiling(ScalarSubcoreTest):
