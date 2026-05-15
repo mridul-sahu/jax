@@ -1187,6 +1187,7 @@ class UnswizzleRef(state_types.Transform):
     return pp.text(f"{{unswizzle({self.swizzle})}}")
 
 
+@util.set_module("jax.experimental.pallas.mosaic_gpu")
 @dataclasses.dataclass
 class BlockSpec(pallas_core.BlockSpec):
   r"""A GPU-specific ``BlockSpec``.

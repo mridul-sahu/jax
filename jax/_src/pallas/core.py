@@ -535,6 +535,7 @@ class _IndexMapFunc:
     return out_indices
 
 
+@util.set_module("jax.experimental.pallas")
 @dataclasses.dataclass
 class BlockSpec:
   """Specifies how an array should be sliced for each invocation of a kernel.
