@@ -2087,7 +2087,7 @@ class LayoutInferenceTest(parameterized.TestCase):
       )
 
     with self.assertRaisesRegex(
-        NotImplementedError, "Only 2D gathers for async load are supported"
+        NotImplementedError, "Only 2D gathers/scatters for async load/store are supported"
     ):
       mgpu.infer_layout(self.module)
 
@@ -2126,7 +2126,7 @@ class LayoutInferenceTest(parameterized.TestCase):
     ):
       mgpu.infer_layout(self.module)
 
-  def test_infer_transforms_for_async_store_gather_indices_raises_not_implemented(self):
+  def test_infer_transforms_for_async_store_gather_indices_ok(self):
     shape = (64, 64)
     elt_ty = ir.BF16Type.get()
 
@@ -2144,15 +2144,15 @@ class LayoutInferenceTest(parameterized.TestCase):
       ])
       zero = arith.constant(ir.IntegerType.get_signless(32), 0)
       smem_ref = mgpu.dialect.with_transforms(smem_ref, transforms)
-      mgpu.dialect.AsyncStoreOp(
+      op = mgpu.dialect.AsyncStoreOp(
         source=smem_ref,
         destination=gmem_ref,
         indices=[gather_indices, zero],
         slice_lengths=shape,
       )
 
-    with self.assertRaises(NotImplementedError):
-      mgpu.infer_layout(self.module)
+    mgpu.infer_layout(self.module)
+    self.assertSequenceEqual(inference_utils.in_transforms(op), [transforms])
 
   def test_infer_transforms_for_try_cluster_cancel_op(self):
 

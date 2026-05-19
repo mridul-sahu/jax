@@ -261,14 +261,20 @@ def _copy_smem_to_gmem_lowering(
       **_extract_smem_copy_params(src_aval, src_transforms),
   }
   if ctx.module_ctx.lowering_semantics == mgpu.LoweringSemantics.Lane:
+    predicate_kwarg: dict[str, Any] = dict(predicate=predicate)
+    if gmem_slice := copy_params.get("gmem_slice", ()):
+      first_idx = gmem_slice[0]
+      # Gather/scatter are incompatible with predictates.
+      if isinstance(first_idx, mgpu.FragmentedArray) and first_idx.shape:
+        predicate_kwarg = {}
     ctx.launch_ctx.async_copy(
         src_ref=src,
         dst_ref=dst,
-        predicate=predicate,
         arrive=commit_group,
         reduction_op=reduction_op,
         oob_mode=OOBFillMode.UNDEFINED,
         **copy_params,
+        **predicate_kwarg,  # pyrefly: ignore[bad-argument-type]
     )
     return ()
 

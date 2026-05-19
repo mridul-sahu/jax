@@ -2093,11 +2093,12 @@ def _async_load_store_constraint_system(
     if isinstance(index.type, ir.VectorType):
       if i != 0:
         raise NotImplementedError("Only leading gather dimensions allowed.")
-      shape = ir.MemRefType(op.source.type).shape
-      if len(shape) != 2:
-        raise NotImplementedError("Only 2D gathers for async load are supported.")
       if isinstance(op, mgpu.AsyncStoreOp):
-        raise NotImplementedError
+        shape = ir.MemRefType(op.destination.type).shape
+      else:
+        shape = ir.MemRefType(op.source.type).shape
+      if len(shape) != 2:
+        raise NotImplementedError("Only 2D gathers/scatters for async load/store are supported.")
       tiling_multiple.append(size)
       continue
     tiling_multiple.append(dynamic_gcd(size, index))
@@ -2109,7 +2110,10 @@ def _async_load_store_constraint_system(
       cs.Divides(expr=var, tiling_multiple=tuple(tiling_multiple))
   ]
   if any(isinstance(idx.type, ir.VectorType) for idx in op.indices):
-    element_bitwidth = utils.bitwidth(op.source.type.element_type)
+    if isinstance(op, mgpu.AsyncStoreOp):
+      element_bitwidth = utils.bitwidth(op.destination.type.element_type)
+    else:
+      element_bitwidth = utils.bitwidth(op.source.type.element_type)
     # This constraint enforces sufficient aligment during SMEM writes.
     # The write chunk needs to be 1024 bit-aligned. For each write in the
     # lowering we transfer 4 rows, so each row must be 256 bit-aligned.

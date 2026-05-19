@@ -366,6 +366,38 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     x = jnp.arange(256).astype(jnp.float32)
     np.testing.assert_array_equal(f(x), x + 10)
 
+  @parameterized.parameters(
+      ((),),
+      ((plgpu.TilingTransform((8, 32)), plgpu.SwizzleTransform(128)),),
+  )
+  def test_copy_smem_to_gmem_scatter(self, transforms):
+    if not jtu.is_cuda_compute_capability_at_least("10.0"):
+      self.skipTest("Only works on a GPU with capability >= sm100")
+    dtype = jnp.int32
+    shape = (64, 128)
+    @functools.partial(
+        self.pallas_call,
+        out_shape=jax.ShapeDtypeStruct(shape, dtype),
+        in_specs=(
+            pl.BlockSpec(memory_space=plgpu.GMEM),
+            pl.BlockSpec(memory_space=plgpu.SMEM),
+        ),
+        out_specs=pl.BlockSpec(memory_space=plgpu.GMEM),
+        scratch_shapes=[plgpu.SMEM(shape, dtype, transforms=transforms), plgpu.Barrier(num_arrivals=1)],
+    )
+    def kernel(tokens_ref, perm_ref, o_ref, smem_ref, barrier_ref):
+      plgpu.copy_gmem_to_smem(tokens_ref, smem_ref, barrier_ref)
+      plgpu.barrier_wait(barrier_ref)
+      idxs = plgpu.load(perm_ref, (), layout=plgpu.Layout.TMA_GATHER_INDICES)
+      plgpu.copy_smem_to_gmem(smem_ref, o_ref.at[idxs, :])
+      plgpu.wait_smem_to_gmem(0)
+
+    key = jax.random.key(0)
+    tokens = jax.random.randint(key, shape, 0, 100, dtype=dtype)
+    perm = jax.random.permutation(key, shape[0]).astype(jnp.uint32)
+    expected = jnp.zeros_like(tokens).at[perm].set(tokens)
+    np.testing.assert_array_equal(kernel(tokens, perm), expected)
+
   @parameterized.product(
       op=[
           lax.neg,
