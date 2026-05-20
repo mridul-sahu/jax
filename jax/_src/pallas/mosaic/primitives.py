@@ -945,15 +945,53 @@ unpack_elementwise_p = jax_core.Primitive("unpack_elementwise")
 
 
 def unpack_elementwise(x, *, index, packed_dtype, unpacked_dtype):
+  """Unpacks an elementwise packed array.
+
+  The packed format is "interleaved" as described in `TPU_UnpackSubelementsOp`.
+  That is, the interleaved subelements in a word are unpacked, resulting in a
+  strided access along second minor dimension in logical array.
+  For example, if a 2D logical array `x` has dtype `int8` and unpacked to
+  `int16`, then
+
+  ```python
+  y = unpack_elementwise(
+      x, index=0, packed_dtype=jnp.int8, unpacked_dtype=jnp.int16)
+  np.testing.assert_array_equal(y, x[0::2, :].astype(jnp.int16))
+  z = unpack_elementwise(
+      x, index=1, packed_dtype=jnp.int8, unpacked_dtype=jnp.int16)
+  np.testing.assert_array_equal(z, x[1::2, :].astype(jnp.int16))
+  ```
+
+  Args:
+    x: The packed array.
+    index: The index of the element to unpack.
+    packed_dtype: The dtype of the packed array.
+    unpacked_dtype: The dtype of the unpacked array.
+
+  Returns:
+    The unpacked array in `unpacked_dtype`.
+  """
+  # `tpu::UnpackElementwiseOp`` requires that the input and output have the same
+  # bitwidth.
+  if dtypes.itemsize_bits(x.dtype) != dtypes.itemsize_bits(unpacked_dtype):
+    x = bitcast(x, unpacked_dtype)
   return unpack_elementwise_p.bind(
-      x, index=index, packed_dtype=packed_dtype, unpacked_dtype=unpacked_dtype
+      x,
+      index=index,
+      packed_dtype=packed_dtype,
+      unpacked_dtype=unpacked_dtype,
   )
 
 
 @unpack_elementwise_p.def_abstract_eval
-def _unpack_elementwise_abstract_eval(x, *, index, packed_dtype, unpacked_dtype):
-  if x.dtype != jnp.uint32:
-    raise ValueError(f"Source must be uint32, got {x.dtype}")
+def _unpack_elementwise_abstract_eval(
+    x, *, index, packed_dtype, unpacked_dtype
+):
+  if dtypes.itemsize_bits(x.dtype) != dtypes.itemsize_bits(unpacked_dtype):
+    raise ValueError(
+        "The bitwidth of `x` must match the bitwidth of `unpacked_dtype` for "
+        f"unpack_elementwise, but got {x.dtype} and {unpacked_dtype}"
+    )
   packing_factor = _get_elementwise_packing_factor(unpacked_dtype, packed_dtype)
   if index < 0 or index >= packing_factor:
     raise ValueError(
