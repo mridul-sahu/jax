@@ -56,7 +56,6 @@ jobs:
         upload_artifacts_to_gcs: false
 
   run_tests:
-    if: github.event.repository.fork == false
     uses: ./.github/workflows/bazel_cpu.yml
 # Begin Presubmit Naming Check - name modification requires internal check to be updated
     strategy:
@@ -92,3 +91,4 @@ jobs:
       build_jax: ${{ 'true' }}
       bazel_command: ${{ (contains(matrix.runner, 'linux-x86') && 'test') || 'build' }}
       clone_main_xla: 0
+      skip: false
