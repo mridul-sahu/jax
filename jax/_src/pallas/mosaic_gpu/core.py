@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import collections
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
+import contextlib
 import dataclasses
 import enum
 import functools
@@ -137,6 +138,8 @@ class CompilerParams:
       raise ValueError(
           "Either both profile_space and profile_dir must be set, or neither."
       )
+
+  replace = dataclasses.replace
 
 
 class MemorySpace(enum.Enum):
@@ -1422,6 +1425,10 @@ class AbstractTMEMRef(state.AbstractRef):
 
 _WARPGROUP_AXIS_NAME = object()
 
+class GpuCoreType():
+  pass
+
+gpu_core_type = GpuCoreType()
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Mesh:
   grid: Sequence[int] = ()
@@ -1486,6 +1493,15 @@ class Mesh:
   def check_is_compatible_with(self, other_mesh):
     raise NotImplementedError()
 
+  @contextlib.contextmanager
+  def tracing_context(self):
+    with (
+        pallas_core.tracing_grid_env(
+            tuple(self.shape.values()), mapped_dims=()
+        ),
+        jax_core.extend_axis_env_nd(self.shape.items()),
+    ):
+      yield
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class WarpMesh:
   """Represents a mesh over individual warps within a warpgroup.
@@ -1511,6 +1527,22 @@ class WarpMesh:
   def discharges_effect(self, effect: jax_core.Effect) -> Literal[False]:
     del effect
     return False
+
+  def check_is_compatible_with(self, other_mesh):
+    raise NotImplementedError()
+
+  @property
+  def core_type(self) -> str:
+    return "warp"
+
+  @property
+  def supported_memory_spaces(self) -> Sequence[Any]:
+    return ()
+
+  @contextlib.contextmanager
+  def tracing_context(self):
+    yield
+
 
 def _gpu_mesh_discharge_rule(
     in_avals,
